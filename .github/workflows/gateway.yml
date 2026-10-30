@@ -1,0 +1,123 @@
+name: zen-gateway
+
+# 一台 runner = 一个出口 IP。额度按 IP 算，所以「换 IP」= 换一台 runner。
+# 4 小时软交班 + 硬超时兜底 + 每 20 分钟 cron 补位，保证链路不断。
+# 网关用仓库里的预编译二进制（bin/zen-direct），不在 runner 上编译。
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_run_sec:
+        description: "本次运行时长上限（秒），调试用；默认 3h50m 主动交班"
+        required: false
+        default: "13800"
+  schedule:
+    - cron: "*/20 * * * *"
+
+permissions:
+  contents: read
+  actions: write # 需要它来 dispatch 下一次运行
+
+concurrency:
+  group: zen-gateway
+  cancel-in-progress: false # 让新 run 排队，等旧 run 自己退场
+
+env:
+  PORT: "8081"
+  PROBE_MODEL: deepseek-v4.1-flash-free
+  PROBE_INTERVAL_SEC: "300"
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout (预编译二进制在这里)
+        uses: actions/checkout@v4
+
+      - name: Prune old runs (keep 3)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          repo="${{ github.repository }}"
+          keep=3
+          echo "只保留最近 $keep 条已完成的 run，更早的删除"
+          gh api "repos/$repo/actions/workflows/gateway.yml/runs?per_page=100" \
+            --jq '[.workflow_runs[] | select(.status == "completed")] | sort_by(.created_at) | reverse | .[3:] | .[].id' \
+          | while read -r id; do
+              [ -n "$id" ] || continue
+              [ "$id" = "${{ github.run_id }}" ] && continue
+              if gh api -X DELETE "repos/$repo/actions/runs/$id" >/dev/null 2>&1; then
+                echo "deleted run $id"
+              else
+                echo "skip run $id (delete failed)"
+              fi
+            done
+
+      - name: Check binary
+        run: |
+          set -euo pipefail
+          chmod +x bin/zen-direct
+          ls -l bin/zen-direct
+          sha256sum bin/zen-direct
+          # ZEN_PROBE_BODY 指向不存在的文件时二进制读完就退 2，用它确认产物能跑
+          rc=0
+          ZEN_PROBE_BODY=/nonexistent/zen-probe bin/zen-direct >/dev/null 2>&1 || rc=$?
+          if [ "$rc" != "2" ]; then
+            echo "::error::bin/zen-direct 跑不起来（rc=$rc）"
+            exit 1
+          fi
+
+      - name: Install cloudflared
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -o bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x bin/cloudflared
+          bin/cloudflared --version
+
+      - name: Serve, tunnel, keepalive
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
+          MAX_RUN_SEC: ${{ inputs.max_run_sec || '13800' }}
+          # 可选：上游出口代理（GitHub runner 的 Azure IP 常被免费层限掉）。
+          # 在仓库 Variables 里配 PROXY_URL=http://user:pass@host:port 即可。
+          PROXY_URL: ${{ vars.PROXY_URL }}
+        run: bash scripts/run-gateway.sh
+
+      - name: Handoff and summary
+        if: always() && !cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          reason="$(cat run/rotate.flag 2>/dev/null || echo '退出但没留原因（被硬超时或异常杀掉）')"
+          {
+            echo "### zen-gateway"
+            echo ""
+            echo "- 交班原因：\`$reason\`"
+            echo "- 本次时长：$(cat run/uptime.txt 2>/dev/null || echo '?')"
+            echo "- 出口 IP：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
+            echo "- 公开地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
+            echo "- 探测统计：$(cat run/probe-stats.txt 2>/dev/null || echo '?')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f run/no-handoff ]; then
+            echo "::error::配置错误，已停止交班；修好后手动 Run workflow"
+            exit 0
+          fi
+
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/gateway.yml/dispatches" \
+            -d '{"ref":"main"}' || echo 000)"
+          echo "dispatch next run -> HTTP $code"
+          if [ "$code" != "204" ]; then
+            echo "::warning::下一次运行没派出去（HTTP $code），靠 cron 补位"
+          fi
