@@ -116,7 +116,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/gateway.yml/dispatches" \
-            -d '{"ref":"main"}' || echo 000)"
+            -d "{\"ref\":\"${GITHUB_REF_NAME:-main}\"}" || echo 000)"
           echo "dispatch next run -> HTTP $code"
           if [ "$code" != "204" ]; then
             echo "::warning::下一次运行没派出去（HTTP $code），靠 cron 补位"
