@@ -18,7 +18,15 @@ REASON="$RUN/rotate.reason"
 PORT="${PORT:-8081}"
 PROBE_MODEL="${PROBE_MODEL:-deepseek-v4.1-flash-free}"
 PROBE_INTERVAL="${PROBE_INTERVAL_SEC:-300}"
-MAX_RUN="${MAX_RUN_SEC:-13500}"
+MAX_RUN="${MAX_RUN_SEC:-10800}"
+case "$MAX_RUN" in
+  ''|*[!0-9]*) MAX_RUN=10800 ;;
+esac
+if [ "${#MAX_RUN}" -gt 5 ]; then
+  MAX_RUN=11400
+elif [ "$MAX_RUN" -gt 11400 ]; then
+  MAX_RUN=11400
+fi
 # 探活必须像一次真实对话，而不是一条“请回复：ok”：
 #   1) 实测 stream:true 才有 200，stream:false 直接 FreeUsageLimitError；
 #   2) 免费层额度按上游 session 计。单条一次性请求每次现签一条新 session，
@@ -31,6 +39,8 @@ PROBE_PAYLOAD="$(printf '{"model":"%s","messages":[{"role":"system","content":"Y
 # 换成自己 VPS/住宅代理的出口就能过。仓库 Variables 里配 PROXY_URL 即可。
 if [ -n "${PROXY_URL:-}" ]; then
   export HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL"
+  export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+  export no_proxy="$NO_PROXY"
 fi
 
 GW_PID=""
@@ -40,6 +50,11 @@ PUBLIC_URL=""
 ok_count=0
 fail_count=0
 limit_count=0
+tunnel_fail=0
+tunnel_selftest_fails=0
+cf_selfcheck_restarts=0
+cf_starts=0
+TUNNEL_STARTED=0
 
 say()  { printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 note() { say "NOTE $*";  echo "::notice::$*"; }
@@ -80,6 +95,13 @@ trap 'exit 130' INT
 finish_stats() {
   printf '%dh%02dm%02ds\n' $((SECONDS / 3600)) $(((SECONDS % 3600) / 60)) $((SECONDS % 60)) > "$RUN/uptime.txt"
   printf 'ok=%d limit=%d fail=%d\n' "$ok_count" "$limit_count" "$fail_count" > "$RUN/probe-stats.txt"
+  local reg reconn proto
+  reg="$(grep -c 'Registered tunnel connection' "$CF_LOG" 2>/dev/null || true)"
+  reconn="$(grep -cE 'Connection terminated|Lost connection|Retrying' "$CF_LOG" 2>/dev/null || true)"
+  proto="$(grep -o 'protocol=[a-z0-9]*' "$CF_LOG" 2>/dev/null | tail -n1 | cut -d= -f2 || true)"
+  printf 'protocol=%s cf_starts=%s reg=%s reconnect=%s selftest_fail=%s cf_selfcheck_restarts=%s cf_crash_restarts=%s gw_crash_restarts=%s warp_reconnect=%s warp_refresh=%s warp_egress_fail=%s\n' \
+    "${proto:-?}" "$cf_starts" "${reg:-0}" "${reconn:-0}" "$tunnel_selftest_fails" "$cf_selfcheck_restarts" "${cf_restarts:-0}" "${gw_restarts:-0}" "${warp_reconnects:-0}" "${warp_refresh_count:-0}" "${warp_egress_fails:-0}" > "$RUN/tunnel-stats.txt"
+  say "TUNNEL_STATS protocol=${proto:-?} cf_starts=$cf_starts reg=${reg:-0} reconnect=${reconn:-0} selftest_fail=$tunnel_selftest_fails cf_selfcheck_restarts=$cf_selfcheck_restarts cf_crash_restarts=${cf_restarts:-0} gw_crash_restarts=${gw_restarts:-0} warp_reconnect=${warp_reconnects:-0} warp_refresh=${warp_refresh_count:-0} warp_egress_fail=${warp_egress_fails:-0}"
 }
 
 # 交班：写原因 -> 记统计 -> 退出。workflow 的收尾步骤负责 dispatch 下一个 run。
@@ -117,7 +139,7 @@ start_gateway() {
 
 http_code() {
   local url="$1" t="${2:-5}" c
-  c="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$t" "$url" 2>/dev/null || true)"
+  c="$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time "$t" "$url" 2>/dev/null || true)"
   printf '%s' "${c:-000}"
 }
 
@@ -132,7 +154,11 @@ wait_local_health() {
 }
 
 start_tunnel() {
-  : > "$CF_LOG"
+  if [ "$TUNNEL_STARTED" = "0" ]; then
+    : > "$CF_LOG"
+    TUNNEL_STARTED=1
+  fi
+  cf_starts=$((cf_starts + 1))
   if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
     "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info run --token "$CF_TUNNEL_TOKEN" >>"$CF_LOG" 2>&1 &
     CF_PID=$!
@@ -155,24 +181,64 @@ start_tunnel() {
     fi
   else
     warn "没有 CF_TUNNEL_TOKEN，用临时隧道（URL 每次都会变）"
+    : > "$CF_LOG"
+    PUBLIC_URL=""
+    : > "$RUN/public-url.txt"
     "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info --url "http://127.0.0.1:$PORT" >>"$CF_LOG" 2>&1 &
     CF_PID=$!
     local i
     for i in $(seq 1 60); do
-      PUBLIC_URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -n1 || true)"
+      PUBLIC_URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | tail -n1 || true)"
       if [ -n "$PUBLIC_URL" ]; then break; fi
       if ! kill -0 "$CF_PID" 2>/dev/null; then warn "cloudflared 提前退出"; break; fi
       sleep 2
     done
+    if [ -z "$PUBLIC_URL" ]; then
+      warn "临时隧道 120s 内没拿到公网 URL，交班换 runner"
+      rotate "临时隧道未拿到公网 URL"
+    fi
   fi
   if [ -n "$PUBLIC_URL" ]; then printf '%s\n' "$PUBLIC_URL" > "$RUN/public-url.txt"; fi
 }
 
+tunnel_selfcheck() {
+  [ -n "$PUBLIC_URL" ] || return 0
+  if [ "$(http_code "http://127.0.0.1:$PORT/health" 5)" != "200" ]; then
+    warn "本地网关 /health 不通，跳过隧道自检"
+    tunnel_fail=0
+    return 0
+  fi
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 10 "$PUBLIC_URL/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then
+    tunnel_fail=0
+    return 0
+  fi
+  tunnel_fail=$((tunnel_fail + 1))
+  tunnel_selftest_fails=$((tunnel_selftest_fails + 1))
+  warn "公网自检 $code（连续 $tunnel_fail/3）"
+  if [ "$tunnel_fail" -ge 3 ]; then
+    if [ "$cf_selfcheck_restarts" -ge 5 ]; then
+      rotate "cloudflared 反复掉线（自检重启 $cf_selfcheck_restarts 次）"
+    fi
+    cf_selfcheck_restarts=$((cf_selfcheck_restarts + 1))
+    warn "隧道连续 3 次自检失败，重启 cloudflared（第 $cf_selfcheck_restarts 次）"
+    stop_proc "$CF_PID" cloudflared
+    start_tunnel
+    wait_public_health 90 || warn "重启后公网仍未恢复"
+    tunnel_fail=0
+  fi
+}
+
 wait_public_health() {
   if [ -z "$PUBLIC_URL" ]; then return 0; fi
-  local deadline=$((SECONDS + 180))
+  local deadline=$((SECONDS + ${1:-180}))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if [ "$(http_code "$PUBLIC_URL/health" 10)" = "200" ]; then
+    if [ -n "$CF_PID" ] && ! kill -0 "$CF_PID" 2>/dev/null; then
+      warn "cloudflared 进程已退出，停止等待公网恢复"
+      return 1
+    fi
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 10 "$PUBLIC_URL/health" 2>/dev/null || true)" = "200" ]; then
       note "公网已通：$PUBLIC_URL"
       return 0
     fi
@@ -201,7 +267,7 @@ probe_once() {
   # 不进会话池、不签 session，upSes 为空，第一发就撞上游 free-usage 429
   # （日志表现就是 ses= 为空 + poisoned+rotate，然后一直换 runner）。
   # 探针必须和真实 harness 走同一条“池内经现签 session”的路。
-  PROBE_CODE="$(curl -sS -o "$out" -w '%{http_code}' --max-time "$max" \
+  PROBE_CODE="$(curl -sS -o "$out" -w '%{http_code}' --noproxy '*' --max-time "$max" \
     -H 'Content-Type: application/json' \
     -H 'Authorization: Bearer public' \
     -H 'User-Agent: zen-probe' \
@@ -328,11 +394,17 @@ fi
 note "IP 可用，开始服务"
 
 next_probe=$((SECONDS + PROBE_INTERVAL))
+next_tunnel_check=$((SECONDS + 120))
 gw_restarts=0
 cf_restarts=0
 
 while :; do
   sleep 15
+
+  if [ "$SECONDS" -ge "$next_tunnel_check" ]; then
+    tunnel_selfcheck
+    next_tunnel_check=$((SECONDS + 60))
+  fi
 
   if [ -s "$REASON" ]; then
     rotate "日志命中 429：$(head -c 200 "$REASON")" fast
@@ -365,6 +437,7 @@ while :; do
       ok)
         ok_count=$((ok_count + 1))
         fail_count=0
+        limit_count=0
         ;;
       limit)
         limit_count=$((limit_count + 1))
@@ -377,6 +450,7 @@ while :; do
         ;;
       *)
         fail_count=$((fail_count + 1))
+        limit_count=0
         warn "周期探测 $PROBE_CODE（连续失败 $fail_count/3）"
         ;;
     esac

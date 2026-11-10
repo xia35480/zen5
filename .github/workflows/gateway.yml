@@ -1,16 +1,16 @@
 name: zen-gateway
 
 # 一台 runner = 一个出口 IP。额度按 IP 算，所以「换 IP」= 换一台 runner。
-# 4 小时软交班 + 硬超时兜底 + 每 20 分钟 cron 补位，保证链路不断。
+# 3 小时软交班 + 硬超时兜底 + 每 20 分钟 cron 补位，保证链路不断。
 # 网关用仓库里的预编译二进制（bin/zen-direct），不在 runner 上编译。
 
 on:
   workflow_dispatch:
     inputs:
       max_run_sec:
-        description: "本次运行时长上限（秒），调试用；默认 3h50m 主动交班"
+        description: "本次运行时长上限（秒），调试用；默认 3h 主动交班"
         required: false
-        default: "13800"
+        default: "10800"
   schedule:
     - cron: "*/20 * * * *"
 
@@ -30,7 +30,7 @@ env:
 jobs:
   serve:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 210
 
     steps:
       - name: Checkout (预编译二进制在这里)
@@ -84,7 +84,7 @@ jobs:
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
-          MAX_RUN_SEC: ${{ inputs.max_run_sec || '13800' }}
+          MAX_RUN_SEC: ${{ inputs.max_run_sec || '10800' }}
           # 可选：上游出口代理（GitHub runner 的 Azure IP 常被免费层限掉）。
           # 在仓库 Variables 里配 PROXY_URL=http://user:pass@host:port 即可。
           PROXY_URL: ${{ vars.PROXY_URL }}
@@ -104,6 +104,7 @@ jobs:
             echo "- 出口 IP：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
             echo "- 公开地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
             echo "- 探测统计：$(cat run/probe-stats.txt 2>/dev/null || echo '?')"
+            echo "- 隧道观测：$(cat run/tunnel-stats.txt 2>/dev/null || echo '?')"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ -f run/no-handoff ]; then
