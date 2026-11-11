@@ -71,6 +71,17 @@ jobs:
             exit 1
           fi
 
+      - name: Fix DNS before any download
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          for ns in 1.1.1.1 8.8.8.8 9.9.9.9; do
+            sudo rm -f /etc/resolv.conf
+            printf 'nameserver %s\nnameserver 2606:4700:4700::1111\n' "$ns" | sudo tee /etc/resolv.conf >/dev/null
+            if getent hosts github.com >/dev/null 2>&1; then break; fi
+          done
+          getent hosts github.com >/dev/null 2>&1 || echo "::warning::公共 DNS 都没通，下载可能失败"
+
       - name: Install cloudflared
         run: |
           set -euo pipefail
@@ -109,6 +120,13 @@ jobs:
 
           if [ -f run/no-handoff ]; then
             echo "::error::配置错误，已停止交班；修好后手动 Run workflow"
+            exit 0
+          fi
+
+          # 服务一次都没真正跑起来（例如 setup 阶段就挂了）时不要再 dispatch：
+          # 否则每个失败的 run 都会拉起下一个 run，变成无限失败循环、白烧 Actions。
+          if [ ! -f run/serve-ok ]; then
+            echo "::error::本次 run 从未成功提供服务，停止自动交班（不再拉起下一个 run）"
             exit 0
           fi
 

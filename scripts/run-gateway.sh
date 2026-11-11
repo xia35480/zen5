@@ -392,6 +392,10 @@ if [ -n "$PUBLIC_URL" ]; then
   fi
 fi
 note "IP 可用，开始服务"
+# 服务真正跑起来了（公网探活通过）才写这个标记：
+# workflow 用它判断"这次 run 有没有真的提供服务"，避免失败 run 无限互相拉起。
+printf '%s\n' "$(date -u +%FT%TZ)" > "$RUN/serve-ok"
+
 
 next_probe=$((SECONDS + PROBE_INTERVAL))
 next_tunnel_check=$((SECONDS + 120))
